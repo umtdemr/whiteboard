@@ -8,22 +8,23 @@ import (
 	"time"
 )
 
-type NatsConfig struct {
-	Url     string
-	Stream  string
-	Subject string
+func SetupNats(url string) (*nats.Conn, error) {
+	nc, err := nats.Connect(
+		url,
+		nats.Timeout(10*time.Second),
+		nats.RetryOnFailedConnect(true),
+		nats.MaxReconnects(-1),
+		nats.ReconnectWait(3*time.Second),
+	)
+
+	return nc, err
 }
 
-func SetupNATS(cfg NatsConfig) (*nats.Conn, jetstream.JetStream, jetstream.Stream, error) {
-	nc, err := nats.Connect(cfg.Url, nats.Timeout(10*time.Second))
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to connect to NATS: %w", err)
-	}
-
+func SetupJetStream(nc *nats.Conn) (jetstream.JetStream, jetstream.Stream, error) {
 	js, err := jetstream.New(nc)
 	if err != nil {
 		nc.Close()
-		return nil, nil, nil, fmt.Errorf("failed to create JetStream context: %w", err)
+		return nil, nil, fmt.Errorf("failed to create JetStream context: %w", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -31,13 +32,13 @@ func SetupNATS(cfg NatsConfig) (*nats.Conn, jetstream.JetStream, jetstream.Strea
 
 	stream, err := js.CreateStream(ctx, jetstream.StreamConfig{
 		Name:     "JOBS",
-		Subjects: []string{cfg.Subject},
+		Subjects: []string{"jobs.>"},
 	})
 
 	if err != nil {
 		nc.Close()
-		return nil, nil, nil, fmt.Errorf("failed to create stream :%w", err)
+		return nil, nil, fmt.Errorf("failed to create stream :%w", err)
 	}
 
-	return nc, js, stream, nil
+	return js, stream, nil
 }
