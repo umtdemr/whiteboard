@@ -9,9 +9,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/umtdemr/wb-backend/internal/data"
 	"github.com/umtdemr/wb-backend/internal/jsonHelper"
-	"github.com/umtdemr/wb-backend/internal/token"
 	"github.com/umtdemr/wb-backend/internal/validator"
-	"io"
 	"time"
 )
 
@@ -20,13 +18,15 @@ const (
 	writeWait = 10 * time.Second
 
 	// Time allowed to read the next pong message from the peer.
-	pongWait = 60 * time.Second
+	pongWait = 5 * time.Second
 
 	// Send pings to peer with this period. Must be less than pongWait.
 	pingPeriod = (pongWait * 9) / 10
 
 	// Maximum message size allowed from peer.
 	maxMessageSize = 512
+
+	joinWait = 10 * time.Second
 )
 
 // Client is a middleman between the websocket connection and the hub.
@@ -44,22 +44,62 @@ type Client struct {
 	user *data.User
 
 	cursor *Cursor
+
+	joined chan struct{}
+}
+
+func CreateNewClient(hub *Hub, conn *websocket.Conn) *Client {
+	client := &Client{
+		hub:    hub,
+		conn:   conn,
+		send:   make(chan []byte, 256),
+		joined: make(chan struct{}),
+	}
+
+	go func() {
+		// wait joinWait seconds to join. If they do not join in, close the connection
+		timer := time.NewTimer(joinWait)
+		defer timer.Stop()
+
+		for {
+			select {
+			case <-client.joined:
+				timer.Stop()
+				return
+			case <-timer.C:
+				client.conn.WriteControl(
+					websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "join timeout"),
+					time.Now().Add(5*time.Second),
+				)
+				client.conn.Close()
+			}
+		}
+	}()
+
+	return client
+}
+
+// incomingMessageReq represents the data that ws clients should send
+type incomingMessageReq struct {
+	Type string          `json:"type"`
+	Data json.RawMessage `json:"data"`
+	Id   string          `json:"id"`
+}
+
+type messageResponse struct {
+	ReplyTo string   `json:"reply_to,omitempty"`
+	Event   string   `json:"event,omitempty"`
+	Data    envelope `json:"data"`
 }
 
 func (c *Client) ReadPump() {
 	defer func() {
-		otherMembers := c.hub.boards[c.boardId]
-		for client, _ := range otherMembers {
-			if client.user.ID == c.user.ID {
-				continue
-			}
+		c.broadCastMessage(messageResponse{
+			Event: EventUserLeft,
+			Data:  envelope{"user": c.user},
+		})
 
-			// let other users know about this user left
-			client.sendCompressedData(messageResponse{
-				Event: StcUserLeft,
-				Data:  envelope{"user": c.user},
-			})
-		}
 		c.hub.unregister <- c
 		c.conn.Close()
 	}()
@@ -77,48 +117,51 @@ func (c *Client) ReadPump() {
 
 		// accept only binary messages
 		if msgType != websocket.BinaryMessage {
+			c.sendErrorResponse("ERR_UNKNOWN_MESSAGE_TYPE", ErrUnknownMessageType.toResponse())
 			continue
 		}
 
-		//c.hub.broadcast <- BroadcastMsg{client: c, message: wsMessage}
 		messageReader := bytes.NewReader(wsMessage)
 		zlibReader, err := zlib.NewReader(messageReader)
 		if err != nil {
+			c.sendErrorResponse("ERR_UNKNOWN_COMPRESSION_METHOD", ErrUnknownCompressionMethod.toResponse())
 			continue
 		}
 
-		byteMessage, msgReadErr := io.ReadAll(zlibReader)
 		closeErr := zlibReader.Close()
 		if closeErr != nil {
 			continue
 		}
 
-		if msgReadErr != nil {
+		var message incomingMessageReq
+
+		if err := jsonHelper.ReadJson(zlibReader, &message); err != nil {
+			c.sendErrorResponse("ERR_JSON_DECODE", ErrorResponse{
+				Code:    ErrCodeJsonDecoding,
+				Message: err.Error(),
+			})
 			continue
 		}
 
-		var message incomingMessageReq
-
-		if err := json.Unmarshal(byteMessage, &message); err != nil {
-			log.Error().Msgf("error on unmarshalling: %v", err)
+		if closeErr := zlibReader.Close(); err != nil {
+			log.Error().Err(closeErr).Msg("Error on closing z lib")
 			continue
 		}
 
 		if message.Id == "" {
-			c.sendErrorResponse("ERR_ID_MUST_SET", &ErrorResponse{
-				Code:    ErrCodeIdMustSet,
-				Message: ErrIdMustSet.Error(),
-			})
+			c.sendErrorResponse("ERR_ID_MUST_SET", ErrIdMustSet.toResponse())
 			continue
 		}
 
 		// if the user has not joined, do not handle the incoming message
 		if message.Type != CmdJoin {
 			if c.boardId == "" {
+				c.sendErrorResponse(message.Id, ErrAuth.toResponse())
 				continue
 			}
 
 			if _, exists := c.hub.boards[c.boardId]; !exists {
+				c.sendErrorResponse(message.Id, ErrAuth.toResponse())
 				continue
 			}
 		}
@@ -133,21 +176,24 @@ func (c *Client) ReadPump() {
 
 // sendCompressedData compresses given message and sends to the client
 func (c *Client) sendCompressedData(message messageResponse) {
-	decoded, err := json.Marshal(message)
+	compressed, err := compressData(message)
 
 	if err != nil {
 		return
 	}
 
-	b := bytes.NewBuffer(nil)
-	msgWriter := zlib.NewWriter(b)
-	_, err = msgWriter.Write(decoded)
+	c.send <- compressed
+}
+
+// broadCastMessage sends given message to other users in the board
+func (c *Client) broadCastMessage(message messageResponse) {
+	compressed, err := compressData(message)
+
 	if err != nil {
 		return
 	}
-	msgWriter.Close()
 
-	c.send <- b.Bytes()
+	c.hub.broadcastToBoard(c.boardId, compressed, c.user.ID)
 }
 
 func (c *Client) sendErrorResponse(replyTo string, message any) {
@@ -161,7 +207,7 @@ func (c *Client) sendErrorResponse(replyTo string, message any) {
 
 // sendErrorAuthResponse sends unauthorized error message to client
 func (c *Client) sendErrorAuthResponse(replyTo string) {
-	c.sendErrorResponse(replyTo, ErrorResponse{Code: ErrCodeAuth, Message: ErrAuth.Error()})
+	c.sendErrorResponse(replyTo, ErrAuth.toResponse())
 }
 
 // handleMessage handles incoming message with incomingMessageReq
@@ -171,10 +217,7 @@ func (c *Client) handleMessage(message *incomingMessageReq) error {
 		fieldError := FieldError{}
 		switch {
 		case errors.Is(err, ErrCmdNotFound):
-			c.sendErrorResponse(message.Id, ErrorResponse{
-				Code:    ErrCodeCmdNotFound,
-				Message: ErrCmdNotFound.Error(),
-			})
+			c.sendErrorResponse(message.Id, ErrCmdNotFound.toResponse())
 			return nil
 		case errors.As(err, &fieldError):
 			c.sendErrorResponse(message.Id, FieldErrorResponse{
@@ -232,109 +275,6 @@ type MessageHandler interface {
 	Handle(replyTo string, client *Client) error
 }
 
-// joinMessage is a request type for the board join requests
-type joinMessage struct {
-	BoardSlugId   string `json:"board_slug_id"`
-	UserAuthToken string `json:"user_auth_token"`
-}
-
-type joinResponseUser struct {
-	User   *data.User `json:"user"`
-	Cursor *Cursor    `json:"cursor"`
-}
-
-type joinResponse struct {
-	OnlineUsers []*joinResponseUser `json:"online_users"`
-}
-
-func (m *joinMessage) Handle(replyTo string, client *Client) error {
-	user, err := client.hub.models.User.GetForToken(token.ScopeAuthentication, m.UserAuthToken)
-	if err != nil {
-		client.sendErrorAuthResponse(replyTo)
-		return nil
-	}
-
-	// set user for the client
-	client.user = user
-	client.boardId = m.BoardSlugId
-
-	// register the user
-	if _, exists := client.hub.boards[client.boardId]; !exists {
-		client.hub.boards[client.boardId] = make(map[*Client]bool)
-	}
-	client.hub.boards[client.boardId][client] = true
-
-	otherUsers := client.hub.boards[client.boardId]
-	usersMap := make(map[int32]bool) // to avoid duplicated reports
-	usersList := make([]*joinResponseUser, 0, len(client.hub.boards[client.boardId]))
-
-	for client := range otherUsers {
-		if client.user.ID == user.ID {
-			continue
-		}
-
-		// let other users know about new online user
-		client.sendCompressedData(messageResponse{
-			Event: StcUserJoined,
-			Data:  envelope{"user": user},
-		})
-
-		// if exists, ignore
-		if _, ok := usersMap[client.user.ID]; ok {
-			continue
-		}
-
-		usersMap[client.user.ID] = true
-		usersList = append(usersList, &joinResponseUser{User: client.user, Cursor: client.cursor})
-	}
-	resp := messageResponse{
-		ReplyTo: replyTo,
-		Data:    envelope{"join": joinResponse{OnlineUsers: usersList}},
-	}
-
-	client.sendCompressedData(resp)
-	return nil
-}
-
-func (m *joinMessage) Validate(v *validator.Validator) {
-	v.Check(len(m.BoardSlugId) == 12, "board_slug_id", "must be 12 bytes long")
-	v.Check(len(m.UserAuthToken) > 5, "user_auth_token", "required")
-}
-
-// cursorMessage is a request type to handle collaborator cursors
-type cursorMessage struct {
-	X float64 `json:"x"`
-	Y float64 `json:"Y"`
-}
-
-func (m *cursorMessage) Handle(replyTo string, client *Client) error {
-	if client.cursor == nil {
-		client.cursor = &Cursor{}
-	}
-	// save cursor
-	client.cursor.X = m.X
-	client.cursor.Y = m.Y
-
-	// send new cursor data to other users in same board
-	allClients := client.hub.GetAllClientsInBoard(client.boardId)
-	for _, otherClient := range allClients {
-		if otherClient.user.ID == client.user.ID {
-			continue
-		}
-
-		otherClient.sendCompressedData(messageResponse{
-			Event: StcCursor,
-			Data: envelope{"cursor": CursorWithUser{
-				UserName: client.user.FullName,
-				UserId:   int64(client.user.ID),
-				Cursor:   client.cursor,
-			}},
-		})
-	}
-
-	return nil
-}
-
 func (c *Client) WritePump() {
 	ticker := time.NewTicker(pingPeriod)
 	defer func() {
@@ -344,14 +284,20 @@ func (c *Client) WritePump() {
 	for {
 		select {
 		case message, ok := <-c.send:
-			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			writeDeadlineErr := c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if writeDeadlineErr != nil {
+				log.Error().Err(writeDeadlineErr).Msg("Error on setting write wait")
+			}
 			if !ok {
 				// The hub closed the channel.
 				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
 
-			c.conn.WriteMessage(websocket.BinaryMessage, message)
+			err := c.conn.WriteMessage(websocket.BinaryMessage, message)
+			if err != nil {
+				log.Error().Err(err).Msg("Error on writing message")
+			}
 		case <-ticker.C:
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
@@ -359,10 +305,4 @@ func (c *Client) WritePump() {
 			}
 		}
 	}
-}
-
-func CreateNewClient(hub *Hub, conn *websocket.Conn) *Client {
-	client := &Client{hub: hub, conn: conn, send: make(chan []byte, 256)}
-
-	return client
 }

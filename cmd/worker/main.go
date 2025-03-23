@@ -28,17 +28,17 @@ func main() {
 	if conf.Environment == "dev" {
 		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
 	}
-	natsConfig := worker.NatsConfig{
-		Url:     conf.NatsServerUrl,
-		Stream:  "JOBS",
-		Subject: "jobs.>",
-	}
 
-	nc, js, stream, err := worker.SetupNATS(natsConfig)
+	nc, err := worker.SetupNats(conf.NatsServerUrl)
 	if err != nil {
 		log.Fatal().Msgf("failed to setup NATS: %v", err)
 	}
 	defer nc.Close()
+
+	js, stream, err := worker.SetupJetStream(nc)
+	if err != nil {
+		log.Fatal().Msgf("failed to setup JetStream: %v", err)
+	}
 
 	jobProcessor := worker.NewWorker(js, stream)
 

@@ -80,18 +80,17 @@ func main() {
 		return time.Now().Unix()
 	}))
 
-	natsConfig := worker.NatsConfig{
-		Url:     conf.NatsServerUrl,
-		Stream:  "JOBS",
-		Subject: "jobs.>",
-	}
-
-	nc, js, stream, err := worker.SetupNATS(natsConfig)
+	nc, err := worker.SetupNats(conf.NatsServerUrl)
 
 	if err != nil {
 		log.Fatal().Msgf("failed to setup NATS: %v", err)
 	}
 	defer nc.Close()
+
+	js, stream, err := worker.SetupJetStream(nc)
+	if err != nil {
+		log.Fatal().Msgf("failed to setup JetStream: %v", err)
+	}
 
 	jobPublisher := worker.NewWorker(js, stream)
 	models := data.NewModels(dbStore)
@@ -101,7 +100,7 @@ func main() {
 		models:       models,
 		jobPublisher: jobPublisher,
 		router:       httprouter.New(),
-		wsHub:        ws.NewHub(models),
+		wsHub:        ws.NewHub(models, nc),
 	}
 
 	go app.wsHub.Run()
